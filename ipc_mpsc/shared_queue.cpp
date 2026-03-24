@@ -14,7 +14,7 @@ namespace {
 constexpr std::uint32_t kProtocolVersion = 1;
 
 std::size_t ShmSize(std::size_t capacity) {
-    return sizeof(QueueMeta) + capacity * sizeof(MessageSlot);
+    return sizeof(QueueMeta) + capacity;
 }
 
 void* MapShm(int fd, std::size_t size) {
@@ -48,17 +48,12 @@ ProducerNode::ProducerNode(const std::string& shm_name,
 
     void* addr = MapShm(shm_fd_, mapped_size_);
     meta_ = static_cast<QueueMeta*>(addr);
-    slots_ = reinterpret_cast<MessageSlot*>(
-                 static_cast<std::uint8_t*>(addr) + sizeof(QueueMeta));
+    buffer_ = reinterpret_cast<std::uint8_t*>(addr) + sizeof(QueueMeta);
 
     meta_->head.store(0, std::memory_order_relaxed);
     meta_->tail.store(0, std::memory_order_relaxed);
     meta_->capacity = capacity_;
     meta_->protocol_version = kProtocolVersion;
-
-    for (std::size_t i = 0; i < capacity_; ++i) {
-        slots_[i].state.store(0, std::memory_order_relaxed);
-    }
 
     std::atomic_thread_fence(std::memory_order_release);
 }
@@ -76,33 +71,54 @@ ProducerNode::~ProducerNode() {
 }
 
 bool ProducerNode::Send(std::uint32_t type, std::string_view data) {
-    if (data.size() > kMaxPayload) {
-        throw std::runtime_error("payload too large");
+    const std::size_t msg_size =
+        sizeof(MessageHeader) + data.size();
+
+    if (msg_size > capacity_) {
+        return false;
     }
 
     while (true) {
-        std::size_t tail = meta_->tail.load(std::memory_order_acquire);
         std::size_t head = meta_->head.load(std::memory_order_acquire);
+        std::size_t tail = meta_->tail.load(std::memory_order_acquire);
 
-        if (tail - head >= capacity_) {
+        std::size_t pos = tail % capacity_;
+
+        std::size_t space_to_end = capacity_ - pos;
+
+        std::size_t needed = msg_size;
+
+        if (space_to_end < msg_size) {
+            needed += space_to_end;
+        }
+
+        if (tail - head + needed > capacity_) {
             return false;
         }
 
-        if (meta_->tail.compare_exchange_weak(
-                tail, tail + 1, std::memory_order_acq_rel)) {
-            std::size_t  idx  = tail % capacity_;
-            MessageSlot& slot = slots_[idx];
-
-            while (slot.state.load(std::memory_order_acquire) != 0) {
-            }
-
-            slot.header.type = type;
-            slot.header.length = static_cast<std::uint32_t>(data.size());
-            std::memcpy(slot.payload, data.data(), data.size());
-
-            slot.state.store(1, std::memory_order_release);
-            return true;
+        if (!meta_->tail.compare_exchange_weak(
+                tail, tail + needed,
+                std::memory_order_acq_rel)) {
+            continue;
         }
+
+        if (space_to_end < msg_size) {
+            MessageHeader pad{0, 0};
+            std::memcpy(buffer_ + pos, &pad, sizeof(pad));
+            pos = 0;
+        }
+
+        MessageHeader header{
+            type,
+            static_cast<uint32_t>(data.size())
+        };
+
+        std::memcpy(buffer_ + pos, &header, sizeof(header));
+        std::memcpy(buffer_ + pos + sizeof(header),
+                    data.data(), data.size());
+
+        std::atomic_thread_fence(std::memory_order_release);
+        return true;
     }
 }
 
@@ -122,9 +138,8 @@ ConsumerNode::ConsumerNode(const std::string& shm_name)
     mapped_size_ = static_cast<std::size_t>(st.st_size);
 
     void* addr = MapShm(shm_fd_, mapped_size_);
-    meta_  = static_cast<QueueMeta*>(addr);
-    slots_ = reinterpret_cast<MessageSlot*>(
-                 static_cast<std::uint8_t*>(addr) + sizeof(QueueMeta));
+    meta_ = static_cast<QueueMeta*>(addr);
+    buffer_ = reinterpret_cast<std::uint8_t*>(addr) + sizeof(QueueMeta);
 
     std::atomic_thread_fence(std::memory_order_acquire);
 
@@ -146,30 +161,50 @@ ConsumerNode::~ConsumerNode() {
     }
 }
 
+
 bool ConsumerNode::Receive(std::uint32_t desired_type,
                            std::vector<std::uint8_t>& out) {
     while (true) {
-        std::size_t head = meta_->head.load(std::memory_order_relaxed);
+        std::size_t head = meta_->head.load(std::memory_order_acquire);
         std::size_t tail = meta_->tail.load(std::memory_order_acquire);
 
         if (head >= tail) {
             return false;
         }
 
-        std::size_t idx = head % capacity_;
-        MessageSlot& slot = slots_[idx];
+        std::size_t pos = head % capacity_;
 
-        while (slot.state.load(std::memory_order_acquire) != 1) {
+        if (head + sizeof(MessageHeader) > tail) {
+            continue;
         }
 
-        bool matched = (slot.header.type == desired_type);
+        MessageHeader header;
+        std::memcpy(&header, buffer_ + pos, sizeof(header));
+
+        if (header.length == 0) {
+            std::size_t skip = capacity_ - pos;
+            meta_->head.store(head + skip, std::memory_order_release);
+            continue;
+        }
+
+        std::size_t msg_size =
+            sizeof(MessageHeader) + header.length;
+
+        if (head + msg_size > tail) {
+            continue;
+        }
+
+        bool matched = (header.type == desired_type);
+
         if (matched) {
-            out.assign(slot.payload,
-                       slot.payload + slot.header.length);
+            out.resize(header.length);
+            std::memcpy(out.data(),
+                        buffer_ + pos + sizeof(header),
+                        header.length);
         }
 
-        slot.state.store(0, std::memory_order_release);
-        meta_->head.store(head + 1, std::memory_order_release);
+        meta_->head.store(head + msg_size,
+                          std::memory_order_release);
 
         if (matched) {
             return true;
