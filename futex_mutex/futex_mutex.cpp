@@ -41,9 +41,8 @@ bool FutexMutex::TryLock() {
 }
 
 void FutexMutex::Unlock() {
-    int old = state_.fetch_sub(1, std::memory_order_release);
-    if (old != 1) {
-        state_.store(0, std::memory_order_release);
+    int old = state_.exchange(0, std::memory_order_release);
+    if (old > 1) {
         FutexWake(&state_, 1);
     }
 }
