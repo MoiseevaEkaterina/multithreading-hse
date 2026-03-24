@@ -12,14 +12,6 @@ struct MessageHeader {
     std::uint32_t length;
 };
 
-inline constexpr std::size_t kMaxPayload = 256;
-
-struct MessageSlot {
-    std::atomic<std::uint32_t> state;
-    MessageHeader header;
-    std::uint8_t payload[kMaxPayload];
-};
-
 struct QueueMeta {
     std::atomic<std::size_t> head;
     std::atomic<std::size_t> tail;
@@ -39,7 +31,7 @@ public:
 
 private:
     QueueMeta* meta_{nullptr};
-    MessageSlot* slots_{nullptr};
+    std::uint8_t* buffer_;
     std::size_t capacity_{0};
     int shm_fd_{-1};
     std::size_t mapped_size_{0};
@@ -58,7 +50,7 @@ public:
 
 private:
     QueueMeta* meta_{nullptr};
-    MessageSlot* slots_{nullptr};
+    std::uint8_t* buffer_;
     std::size_t capacity_{0};
     int shm_fd_{-1};
     std::size_t mapped_size_{0};
